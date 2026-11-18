@@ -5908,6 +5908,129 @@ mod tests {
         assert_eq!(next_anchor, "message-2");
     }
 
+    #[cfg(feature = "extended-tests")]
+    #[test]
+    fn pi_start_failure_only_releases_the_lane_when_input_was_not_sent() {
+        use crate::context::ContextService;
+        use crate::runtime::{ExecutionRuntimeService, FailAgentRunCommand};
+
+        for (error, input_status, run_status) in [
+            (
+                crate::pi::PiInputNotSent("Pi RPC outbound record exceeds the safety limit".into())
+                    .into(),
+                "not_accepted",
+                "running",
+            ),
+            (
+                anyhow::anyhow!("Pi RPC response channel closed: prompt"),
+                "delivery_unknown",
+                "waiting",
+            ),
+        ] {
+            let mut fixture = Fixture::new();
+            fixture.enqueue("first-pi-input", "第一次投递");
+            let run = claim_waiting_delivery_batches(&mut fixture.database, 1)
+                .unwrap()
+                .remove(0);
+            fixture
+                .database
+                .connection()
+                .execute(
+                    "UPDATE agent_run SET runtime_adapter_kind='pi', runtime_protocol_version='pi-jsonl-rpc-v1' WHERE id=?1",
+                    [&run],
+                )
+                .unwrap();
+            let context = fixture.materialize_run(&run);
+            let input = ContextService
+                .prepare_input_delivery_for_context(&mut fixture.database, &run, 1, &context)
+                .unwrap();
+            assert!(
+                ContextService
+                    .begin_runtime_input_dispatch(&mut fixture.database, &input.id, &run, 1)
+                    .unwrap()
+            );
+            let next_delivery = fixture.enqueue("next-pi-input", "下一次投递");
+
+            let error = crate::application::record_pi_start_prompt_failure(
+                &mut fixture.database,
+                &input.id,
+                error,
+            )
+            .unwrap_err();
+            assert_eq!(
+                ContextService
+                    .runtime_input_delivery_status(&fixture.database, &input.id)
+                    .unwrap()
+                    .as_deref(),
+                Some(input_status)
+            );
+            let (status, version): (String, i64) = fixture
+                .database
+                .connection()
+                .query_row(
+                    "SELECT status, version FROM agent_run WHERE id=?1",
+                    [&run],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(status, run_status);
+
+            let failure = ExecutionRuntimeService::default()
+                .fail_agent_run_without_runtime_terminal(
+                    &mut fixture.database,
+                    &CommandEnvelope {
+                        command_id: "terminal-pi-start-failure".into(),
+                        actor: ActorRef::System {
+                            component_id: "runtime-adapter:pi".into(),
+                        },
+                        camp_id: Some(fixture.camp_id.clone()),
+                        expected_versions: vec![],
+                        execution_epoch: None,
+                        payload: FailAgentRunCommand {
+                            agent_run_id: run.clone(),
+                            expected_version: version,
+                            execution_epoch: 1,
+                            error_code: "runtime_launch_failed".into(),
+                            error_detail: Some(error.to_string()),
+                            failure: None,
+                            manual_retry_allowed: false,
+                            ending_git_observation: None,
+                        },
+                    },
+                )
+                .unwrap();
+            if input_status == "not_accepted" {
+                assert_eq!(failure.result.code, "agent_run.failed");
+                let terminal_status: String = fixture
+                    .database
+                    .connection()
+                    .query_row("SELECT status FROM agent_run WHERE id=?1", [&run], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(terminal_status, "failed");
+                let next = claim_waiting_delivery_batches(&mut fixture.database, 1).unwrap();
+                let claimed_run: String = fixture
+                    .database
+                    .connection()
+                    .query_row(
+                        "SELECT claimed_agent_run_id FROM camp_message_delivery WHERE id=?1",
+                        [&next_delivery],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(next, vec![claimed_run]);
+            } else {
+                assert_eq!(failure.result.code, "agent_run.terminal_fenced");
+                assert!(
+                    claim_waiting_delivery_batches(&mut fixture.database, 1)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
+
     #[test]
     fn cleanup_ack_only_blocks_the_exact_current_execution() {
         for owned_epoch in [None, Some(0), Some(1)] {

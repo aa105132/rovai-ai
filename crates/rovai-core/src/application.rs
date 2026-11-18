@@ -18623,9 +18623,18 @@ impl Core {
         if delivery.status != "prepared" {
             anyhow::bail!("Pi Runtime Input Delivery is not ready to send");
         }
-        let prompt_images = self
+        let prompt_images = match self
             .prepare_pi_input_images(&delivery.id, &prepared_context.rendered_payload, &runtime)
-            .await?;
+            .await
+        {
+            Ok(images) => images,
+            Err(error) => {
+                let mut database = self.database.lock().await;
+                let error =
+                    pi::PiInputNotSent(format!("failed to prepare Pi prompt images: {error:#}"));
+                return record_pi_start_prompt_failure(&mut database, &delivery.id, error.into());
+            }
+        };
         self.begin_agent_run_input_dispatch(execution, &delivery.id, launch_permit)
             .await?;
         if let Err(error) = runtime
@@ -18633,12 +18642,7 @@ impl Core {
             .await
         {
             let mut database = self.database.lock().await;
-            ContextService.mark_input_delivery_unknown(
-                &mut database,
-                &delivery.id,
-                "Pi prompt acceptance could not be confirmed",
-            )?;
-            return Err(error).context("Pi input delivery outcome is unknown");
+            return record_pi_start_prompt_failure(&mut database, &delivery.id, error);
         }
         self.complete_active_runtime_route_handoff(
             execution,
@@ -26696,6 +26700,27 @@ async fn persist_acp_prompt_completion(
         }
     }
     Ok(())
+}
+
+pub(crate) fn record_pi_start_prompt_failure(
+    database: &mut Database,
+    delivery_id: &str,
+    error: anyhow::Error,
+) -> Result<()> {
+    if let Some(not_sent) = error.downcast_ref::<pi::PiInputNotSent>() {
+        ContextService.mark_input_delivery_not_accepted(
+            database,
+            delivery_id,
+            &not_sent.to_string(),
+        )?;
+        return Err(error);
+    }
+    ContextService.mark_input_delivery_unknown(
+        database,
+        delivery_id,
+        "Pi prompt acceptance could not be confirmed",
+    )?;
+    Err(error).context("Pi input delivery outcome is unknown")
 }
 
 fn pi_prompt_terminal_outcome(stop_reason: &str) -> RuntimeTerminalOutcome {

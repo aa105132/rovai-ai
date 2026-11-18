@@ -53,8 +53,8 @@ use crate::{
 
 use super::{
     PI_COMMAND_TIMEOUT, PI_HOST_EXTENSION_VERSION, PI_MAX_INBOUND_RECORD_BYTES,
-    PI_MAX_OUTBOUND_RECORD_BYTES, PI_PROTOCOL_VERSION, PiIncoming, PiTransportFailure,
-    assistant_message_text, completed_action, read_jsonl_record, value_id,
+    PI_MAX_OUTBOUND_RECORD_BYTES, PI_PROTOCOL_VERSION, PiIncoming, PiInputNotSent,
+    PiTransportFailure, assistant_message_text, completed_action, read_jsonl_record, value_id,
 };
 
 const MANAGED_HOST_EXTENSION: &str = include_str!("managed-host.ts");
@@ -266,6 +266,19 @@ impl std::fmt::Display for PiRpcCommandRejected {
 }
 
 impl std::error::Error for PiRpcCommandRejected {}
+
+fn encode_outbound_record(message: &Value) -> Result<Vec<u8>> {
+    let encoded = serde_json::to_vec(message).map_err(|error| PiInputNotSent(error.to_string()))?;
+    if encoded.len() > PI_MAX_OUTBOUND_RECORD_BYTES {
+        return Err(PiInputNotSent(format!(
+            "Pi RPC outbound record exceeds the safety limit: {} bytes, limit {} bytes",
+            encoded.len(),
+            PI_MAX_OUTBOUND_RECORD_BYTES
+        ))
+        .into());
+    }
+    Ok(encoded)
+}
 
 fn switch_target_is_explicitly_unavailable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<rovai_core::runtime::NativeSessionResumeFailure>()
@@ -926,7 +939,7 @@ impl PiHost {
         fields: Value,
     ) -> Result<oneshot::Receiver<Result<Value>>> {
         if !self.is_alive() {
-            bail!("Pi RPC Host is not alive");
+            return Err(PiInputNotSent("Pi RPC Host is not alive".into()).into());
         }
         let id = format!("rovai-pi-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let mut command = fields.as_object().cloned().unwrap_or_default();
@@ -972,10 +985,7 @@ impl PiHost {
     }
 
     async fn send(&self, message: Value) -> Result<()> {
-        let encoded = serde_json::to_vec(&message)?;
-        if encoded.len() > PI_MAX_OUTBOUND_RECORD_BYTES {
-            bail!("Pi RPC outbound record exceeds the safety limit");
-        }
+        let encoded = encode_outbound_record(&message)?;
         let mut stdin = self.stdin.lock().await;
         stdin.write_all(&encoded).await?;
         stdin.write_all(b"\n").await?;
@@ -1470,10 +1480,12 @@ impl PiRuntime {
         *self.final_message.write().await = None;
         *self.final_stop_reason.write().await = None;
         self.active_tool_executions.lock().await.clear();
-        self.validate_images(images)?;
+        self.validate_images(images)
+            .map_err(|error| PiInputNotSent(error.to_string()))?;
         let mut fields = json!({"message":message});
         if !images.is_empty() {
-            fields["images"] = serde_json::to_value(images)?;
+            fields["images"] =
+                serde_json::to_value(images).map_err(|error| PiInputNotSent(error.to_string()))?;
         }
         let response = self.host.command("prompt", fields).await?;
         if response.get("command").and_then(Value::as_str) != Some("prompt") {
@@ -3177,6 +3189,10 @@ while IFS= read -r request; do
       printf '{"type":"response","id":"%s","success":false,"command":"reject_command","error":"fixture rejection"}\n' "$request_id"
       ;;
     prompt)
+      if [ -f "$fixture_dir/accept-prompt" ]; then
+        printf '{"type":"response","id":"%s","success":true,"command":"prompt","data":{}}\n' "$request_id"
+        continue
+      fi
       event='{"type":"agent_settled"}'
       printf '%s\n' "$event" >> "$event_log"
       printf '%s\n' "$event"
@@ -3875,12 +3891,20 @@ done
                 };
                 assert_eq!(message, frame);
                 assert!(host.is_alive());
-                // Outbound retains its independent 4 MiB budget.
-                assert!(
-                    host.send(json!({"message":"x".repeat(PI_MAX_OUTBOUND_RECORD_BYTES)}))
-                        .await
-                        .is_err()
-                );
+                File::create(root.join("accept-prompt")).unwrap();
+                host.command("prompt", json!({"message":"x".repeat(5 * 1024 * 1024)}))
+                    .await
+                    .unwrap();
+                let locked_stdin = host.stdin.lock().await;
+                let error = timeout(
+                    Duration::from_secs(5),
+                    host.send(json!({"message":"x".repeat(PI_MAX_OUTBOUND_RECORD_BYTES)})),
+                )
+                .await
+                .expect("超限应在尝试获取 stdin 锁前被拒绝")
+                .unwrap_err();
+                assert!(error.downcast_ref::<PiInputNotSent>().is_some());
+                drop(locked_stdin);
                 assert!(host.is_alive());
                 let file = File::create(root.join("record.jsonl")).unwrap();
                 file.set_len((PI_MAX_INBOUND_RECORD_BYTES + 1) as u64)
@@ -3903,6 +3927,7 @@ done
                 )
                 .await
                 .unwrap_err();
+            assert!(error.downcast_ref::<PiInputNotSent>().is_none());
             if exit_case != "eof" {
                 assert!(error.downcast_ref::<PiTransportFailure>().is_some());
             }
@@ -4091,6 +4116,27 @@ done
             assert!(!session_file.to_string_lossy().contains('?'));
         }
         Ok(())
+    }
+
+    #[test]
+    fn outbound_prompt_records_accept_the_exact_64_mib_limit() {
+        let limit = 64 * 1024 * 1024;
+        assert_eq!(PI_MAX_OUTBOUND_RECORD_BYTES, limit);
+        let mut prompt = json!({"type": "prompt", "id": "test", "message": ""});
+        let overhead = serde_json::to_vec(&prompt).unwrap().len();
+        for size in [5 * 1024 * 1024, limit, limit + 1] {
+            prompt["message"] = Value::String("x".repeat(size - overhead));
+            match encode_outbound_record(&prompt) {
+                Ok(encoded) => {
+                    assert!(size <= limit);
+                    assert_eq!(encoded.len(), size);
+                }
+                Err(error) => {
+                    assert!(size > limit);
+                    assert!(error.is::<PiInputNotSent>());
+                }
+            }
+        }
     }
 
     #[test]

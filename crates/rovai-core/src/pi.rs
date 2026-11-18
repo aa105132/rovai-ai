@@ -28,8 +28,19 @@ pub(crate) const PI_HOST_EXTENSION_VERSION: &str = "rovai-pi-host-v8";
 // Pi image results may include the same base64 data in content and structuredContent.
 // Receive and send budgets are independent; stderr retains its own smaller limit.
 pub(super) const PI_MAX_INBOUND_RECORD_BYTES: usize = 64 * 1024 * 1024;
-pub(super) const PI_MAX_OUTBOUND_RECORD_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const PI_MAX_OUTBOUND_RECORD_BYTES: usize = 64 * 1024 * 1024;
 pub(super) const PI_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
+
+#[derive(Debug)]
+pub(crate) struct PiInputNotSent(pub(crate) String);
+
+impl fmt::Display for PiInputNotSent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PiInputNotSent {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PiTransportFailure {
